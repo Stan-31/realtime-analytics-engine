@@ -1,7 +1,8 @@
 """Composition root for the consumer process.
 
-Phase 6 wiring: kafka ingest → aggregator → tick loop → batched DB writer.
-WebSocket fan-out (phase 7) joins next.
+Phase 7 wiring: kafka ingest → aggregator → tick loop → batched DB writer
++ WebSocket fan-out hub. All four tasks share a single stop event and the
+process exits non-zero on any unhandled task failure.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from aggregator import Aggregate, Aggregator
 from config import Settings
 from db_writer import db_writer_loop
 from kafka_io import consume_loop
+from ws_hub import WebSocketHub, ws_server_loop
 
 log = logging.getLogger("consumer.main")
 
@@ -31,6 +33,7 @@ async def _tick_loop(
     settings: Settings,
     aggregator: Aggregator,
     db_queue: asyncio.Queue[list[Aggregate]],
+    hub: WebSocketHub,
     stop: asyncio.Event,
 ) -> None:
     """Emit a snapshot every `tick_interval_seconds` and fan it out."""
@@ -48,16 +51,15 @@ async def _tick_loop(
         snapshot = aggregator.snapshot()
         if not snapshot:
             continue
-        # Hand off to the DB writer. Queue is unbounded by design — a single
-        # snapshot is at most ~len(symbols) rows so the memory ceiling is tiny.
+        # Hand off to the DB writer (unbounded queue — one snapshot is at most
+        # ~len(symbols) rows) and the WS hub (non-blocking, drops slow clients).
         db_queue.put_nowait(snapshot)
-        # Throttle the human-readable log line to once per ~5s so the
-        # container logs stay readable at 1Hz.
+        await hub.broadcast(snapshot)
         if time.monotonic() - last_log >= 5.0:
             preview = ", ".join(
                 f"{a.symbol}={a.avg_price:.2f}(n={a.sample_count})" for a in snapshot
             )
-            log.info("snapshot %s", preview)
+            log.info("snapshot %s ws_clients=%d", preview, hub.client_count)
             last_log = time.monotonic()
 
 
@@ -91,6 +93,7 @@ async def main() -> int:
 
     aggregator = Aggregator(window_seconds=settings.window_seconds)
     db_queue: asyncio.Queue[list[Aggregate]] = asyncio.Queue()
+    hub = WebSocketHub(send_timeout=settings.ws_send_timeout_seconds)
     stop = asyncio.Event()
 
     loop = asyncio.get_running_loop()
@@ -102,10 +105,11 @@ async def main() -> int:
 
     ingest = asyncio.create_task(consume_loop(settings, aggregator, stop), name="ingest")
     tick = asyncio.create_task(
-        _tick_loop(settings, aggregator, db_queue, stop), name="tick"
+        _tick_loop(settings, aggregator, db_queue, hub, stop), name="tick"
     )
     db = asyncio.create_task(db_writer_loop(settings, db_queue, stop), name="db")
-    tasks = (ingest, tick, db)
+    ws = asyncio.create_task(ws_server_loop(settings, hub, stop), name="ws")
+    tasks = (ingest, tick, db, ws)
     for t in tasks:
         _supervise(t, stop)
 
