@@ -1,7 +1,7 @@
 """Composition root for the consumer process.
 
-Phase 5 wiring: kafka ingest → aggregator → log-only tick loop. Subsequent
-phases add the batched DB writer (phase 6) and the WebSocket fan-out (phase 7).
+Phase 6 wiring: kafka ingest → aggregator → tick loop → batched DB writer.
+WebSocket fan-out (phase 7) joins next.
 """
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ try:
 except ImportError:  # pragma: no cover - Windows / fallback
     pass
 
-from aggregator import Aggregator
+from aggregator import Aggregate, Aggregator
 from config import Settings
+from db_writer import db_writer_loop
 from kafka_io import consume_loop
 
 log = logging.getLogger("consumer.main")
@@ -29,15 +30,13 @@ log = logging.getLogger("consumer.main")
 async def _tick_loop(
     settings: Settings,
     aggregator: Aggregator,
+    db_queue: asyncio.Queue[list[Aggregate]],
     stop: asyncio.Event,
 ) -> None:
-    """Emit a snapshot every `tick_interval_seconds`.
-
-    For phase 5 this is log-only so the pipeline is observable end-to-end
-    before the DB writer and WS hub land.
-    """
+    """Emit a snapshot every `tick_interval_seconds` and fan it out."""
     interval = settings.tick_interval_seconds
     next_tick = time.monotonic() + interval
+    last_log = time.monotonic()
     while not stop.is_set():
         sleep_for = max(0.0, next_tick - time.monotonic())
         try:
@@ -47,9 +46,19 @@ async def _tick_loop(
             pass
         next_tick += interval
         snapshot = aggregator.snapshot()
-        if snapshot:
-            preview = ", ".join(f"{a.symbol}={a.avg_price:.2f}(n={a.sample_count})" for a in snapshot)
+        if not snapshot:
+            continue
+        # Hand off to the DB writer. Queue is unbounded by design — a single
+        # snapshot is at most ~len(symbols) rows so the memory ceiling is tiny.
+        db_queue.put_nowait(snapshot)
+        # Throttle the human-readable log line to once per ~5s so the
+        # container logs stay readable at 1Hz.
+        if time.monotonic() - last_log >= 5.0:
+            preview = ", ".join(
+                f"{a.symbol}={a.avg_price:.2f}(n={a.sample_count})" for a in snapshot
+            )
             log.info("snapshot %s", preview)
+            last_log = time.monotonic()
 
 
 def _supervise(task: asyncio.Task, stop: asyncio.Event) -> None:
@@ -81,6 +90,7 @@ async def main() -> int:
     )
 
     aggregator = Aggregator(window_seconds=settings.window_seconds)
+    db_queue: asyncio.Queue[list[Aggregate]] = asyncio.Queue()
     stop = asyncio.Event()
 
     loop = asyncio.get_running_loop()
@@ -91,18 +101,21 @@ async def main() -> int:
             pass
 
     ingest = asyncio.create_task(consume_loop(settings, aggregator, stop), name="ingest")
-    tick = asyncio.create_task(_tick_loop(settings, aggregator, stop), name="tick")
-    for t in (ingest, tick):
+    tick = asyncio.create_task(
+        _tick_loop(settings, aggregator, db_queue, stop), name="tick"
+    )
+    db = asyncio.create_task(db_writer_loop(settings, db_queue, stop), name="db")
+    tasks = (ingest, tick, db)
+    for t in tasks:
         _supervise(t, stop)
 
     await stop.wait()
     log.info("shutdown requested; cancelling tasks")
-    for t in (ingest, tick):
+    for t in tasks:
         t.cancel()
-    await asyncio.gather(ingest, tick, return_exceptions=True)
+    await asyncio.gather(*tasks, return_exceptions=True)
     log.info("consumer stopped")
-    # Non-zero if a task crashed (and so set the stop event itself).
-    crashed = any(t.done() and not t.cancelled() and t.exception() for t in (ingest, tick))
+    crashed = any(t.done() and not t.cancelled() and t.exception() for t in tasks)
     return 1 if crashed else 0
 
 
