@@ -1,0 +1,79 @@
+name: realtime-analytics
+
+networks:
+  analytics-net:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  timescale-data:
+
+services:
+  # --------------------------------------------------------------------------
+  # Kafka 3.7 in KRaft single-node mode (no Zookeeper).
+  # --------------------------------------------------------------------------
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: analytics-kafka
+    restart: unless-stopped
+    ports:
+      - "${KAFKA_EXTERNAL_PORT:-9092}:9092"
+    environment:
+      # KRaft node identity / role
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      # Listeners: internal (other containers) + external (host) + controller
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT:-9092}"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      # Topic auto-create + single-broker replication
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_CFG_NUM_PARTITIONS: "${TICKS_PARTITIONS:-8}"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes:
+      - kafka-data:/bitnami/kafka
+    networks: [analytics-net]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          /opt/bitnami/kafka/bin/kafka-topics.sh
+          --bootstrap-server localhost:9092 --list >/dev/null 2>&1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # TimescaleDB on PostgreSQL 16 — schema bootstrapped via init script.
+  # --------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: analytics-timescaledb
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_EXTERNAL_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-analytics}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-analytics}
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      - ./timescaledb/init:/docker-entrypoint-initdb.d:ro
+    networks: [analytics-net]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          pg_isready -U ${POSTGRES_USER:-analytics} -d ${POSTGRES_DB:-analytics}
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
