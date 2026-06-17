@@ -77,3 +77,22 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+
+  # --------------------------------------------------------------------------
+  # Market-data producer — async GBM walk publishing to `market.ticks`.
+  # --------------------------------------------------------------------------
+  producer:
+    build: ./producer
+    container_name: analytics-producer
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      TICKS_TOPIC: ${TICKS_TOPIC:-market.ticks}
+      EVENTS_PER_SECOND: ${EVENTS_PER_SECOND:-2500}
+      SYMBOLS: ${SYMBOLS:-AAPL,MSFT,GOOG,AMZN,NVDA}
+      MALFORMED_RATE: ${MALFORMED_RATE:-0.001}
+      PRODUCER_LOG_INTERVAL_SECONDS: ${PRODUCER_LOG_INTERVAL_SECONDS:-5}
+    networks: [analytics-net]
