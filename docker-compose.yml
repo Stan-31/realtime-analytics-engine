@@ -96,3 +96,37 @@ services:
       MALFORMED_RATE: ${MALFORMED_RATE:-0.001}
       PRODUCER_LOG_INTERVAL_SECONDS: ${PRODUCER_LOG_INTERVAL_SECONDS:-5}
     networks: [analytics-net]
+
+  # --------------------------------------------------------------------------
+  # Consumer — ingest + sliding-window aggregation + DLQ + (phases 6-7)
+  # batched persistence + websocket fanout.
+  # --------------------------------------------------------------------------
+  consumer:
+    build: ./consumer
+    container_name: analytics-consumer
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      TICKS_TOPIC: ${TICKS_TOPIC:-market.ticks}
+      DLQ_TOPIC: ${DLQ_TOPIC:-market.ticks.dlq}
+      CONSUMER_GROUP: ${CONSUMER_GROUP:-analytics-consumer}
+      WINDOW_SECONDS: ${WINDOW_SECONDS:-10}
+      TICK_INTERVAL_SECONDS: ${TICK_INTERVAL_SECONDS:-1.0}
+      DB_BATCH_SIZE: ${DB_BATCH_SIZE:-200}
+      DB_BATCH_INTERVAL_MS: ${DB_BATCH_INTERVAL_MS:-500}
+      WS_HOST: ${WS_HOST:-0.0.0.0}
+      WS_PORT: ${WS_PORT:-8765}
+      WS_SEND_TIMEOUT_SECONDS: ${WS_SEND_TIMEOUT_SECONDS:-1.0}
+      POSTGRES_USER: ${POSTGRES_USER:-analytics}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-analytics}
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
+      POSTGRES_HOST: ${POSTGRES_HOST:-timescaledb}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+    expose:
+      - "8765"
+    networks: [analytics-net]
