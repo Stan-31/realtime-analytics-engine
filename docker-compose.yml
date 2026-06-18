@@ -130,3 +130,17 @@ services:
     expose:
       - "8765"
     networks: [analytics-net]
+
+  # --------------------------------------------------------------------------
+  # Frontend — Vite-built React SPA served by nginx with a /ws reverse proxy
+  # into the consumer's WebSocket hub.
+  # --------------------------------------------------------------------------
+  frontend:
+    build: ./frontend
+    container_name: analytics-frontend
+    restart: unless-stopped
+    depends_on:
+      - consumer
+    ports:
+      - "${FRONTEND_EXTERNAL_PORT:-8080}:80"
+    networks: [analytics-net]
